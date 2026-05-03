@@ -1,13 +1,12 @@
 import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation } from '@tanstack/react-query';
 import { Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, ShieldCheck, Zap } from 'lucide-react';
 import { getStatus, cleanAudioCache, setSessionRestore } from './lib/voxaria-api';
 
 function App() {
-  const queryClient = useQueryClient();
   const [sessionRestore, setSessionRestoreState] = useState(true);
 
-  const { data: status, isLoading, isError } = useQuery({
+  const { data: status, isLoading } = useQuery({
     queryKey: ['botStatus'],
     queryFn: getStatus,
     refetchInterval: 5000,
