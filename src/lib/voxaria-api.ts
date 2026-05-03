@@ -14,6 +14,8 @@ export interface CurrentSongResponse {
     title: string;
     artist: string;
     currentTime?: number;
+    startTime?: number; // Timestamp when song started (Date.now())
+    isPlaying?: boolean;
 }
 
 export interface LyricLine {

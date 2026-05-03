@@ -1,10 +1,13 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, ShieldCheck, Zap, Music } from 'lucide-react';
 import { getStatus, cleanAudioCache, setSessionRestore, summonBot, getCurrentSong, getLyrics, type LyricLine } from './lib/voxaria-api';
 
 function App() {
   const [sessionRestore, setSessionRestoreState] = useState(true);
+  const [lastKnownTime, setLastKnownTime] = useState<number | null>(null);
+  const [arrivalTimestamp, setArrivalTimestamp] = useState<number | null>(null);
+  const [smoothTime, setSmoothTime] = useState<number>(0);
 
   const { data: status, isLoading } = useQuery({
     queryKey: ['botStatus'],
@@ -24,6 +27,32 @@ function App() {
     queryFn: () => getLyrics(currentSong!.title, currentSong!.artist),
     enabled: !!currentSong?.title && !!currentSong?.artist,
   });
+
+  // Update interpolation data when currentTime changes
+  useEffect(() => {
+    if (currentSong?.currentTime !== undefined) {
+      setLastKnownTime(currentSong.currentTime);
+      setArrivalTimestamp(Date.now());
+    }
+  }, [currentSong?.currentTime]);
+
+  // Smooth interpolation using requestAnimationFrame
+  useEffect(() => {
+    if (lastKnownTime === null || arrivalTimestamp === null) {
+      setSmoothTime(0);
+      return;
+    }
+
+    const animate = () => {
+      const now = Date.now();
+      const elapsed = now - arrivalTimestamp;
+      setSmoothTime(lastKnownTime + elapsed);
+      requestAnimationFrame(animate);
+    };
+
+    const id = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(id);
+  }, [lastKnownTime, arrivalTimestamp]);
 
   const cleanCacheMutation = useMutation({
     mutationFn: cleanAudioCache,
@@ -190,13 +219,13 @@ function App() {
             <div className="flex-grow flex flex-col gap-4">
               <div className="text-sm text-gray-400">
                 <div className="font-medium">{currentSong.title} - {currentSong.artist}</div>
-                <div>Current Time: {currentSong.currentTime ? `${Math.floor(currentSong.currentTime / 1000)}s` : 'N/A'}</div>
+                <div>Current Time: {smoothTime ? `${Math.floor(smoothTime / 1000)}s` : 'N/A'}</div>
               </div>
               
               <div className="lyrics-container max-h-64 overflow-y-auto space-y-2">
                 {lyrics ? lyrics.map((line, index) => {
                   const LYRIC_OFFSET = 3000;
-                  const adjustedTime = (currentSong.currentTime || 0) - LYRIC_OFFSET;
+                  const adjustedTime = smoothTime - LYRIC_OFFSET;
                   const isActive = adjustedTime >= line.time && (index === lyrics.length - 1 || adjustedTime < lyrics[index + 1].time);
                   return (
                     <div 

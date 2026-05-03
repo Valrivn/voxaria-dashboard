@@ -1,10 +1,18 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, ShieldCheck, Zap, Music } from 'lucide-react';
 import { getStatus, cleanAudioCache, setSessionRestore, summonBot, getCurrentSong, getLyrics, type LyricLine } from './lib/voxaria-api';
 
 function App() {
   const [sessionRestore, setSessionRestoreState] = useState(true);
+  const [smoothTime, setSmoothTime] = useState(0);
+  const [manualOffset, setManualOffset] = useState(3.0);
+  const [startTime, setStartTime] = useState<number | null>(null); // Bot's song start timestamp
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [syncTime, setSyncTime] = useState(0); // Absolute sync time in ms
+  
+  const SYNC_TOLERANCE_MS = 500; // 500ms tolerance for lyric highlighting
+  const KALMAN_GAIN = 0.2;
 
   const { data: status, isLoading } = useQuery({
     queryKey: ['botStatus'],
@@ -14,8 +22,20 @@ function App() {
 
   const { data: currentSong } = useQuery({
     queryKey: ['currentSong'],
-    queryFn: getCurrentSong,
-    refetchInterval: 1000,
+    queryFn: async () => {
+      const data = await getCurrentSong();
+      
+      // Extract startTime and isPlaying from bot response
+      if (data.startTime !== undefined) {
+        setStartTime(data.startTime);
+      }
+      if (data.isPlaying !== undefined) {
+        setIsPlaying(data.isPlaying);
+      }
+      
+      return data;
+    },
+    refetchInterval: 3000, // Tighten to 3 seconds for aggressive drift correction
     enabled: status?.online,
   });
 
@@ -24,6 +44,48 @@ function App() {
     queryFn: () => getLyrics(currentSong!.title, currentSong!.artist),
     enabled: !!currentSong?.title && !!currentSong?.artist,
   });
+
+  // High-Frequency Sync Loop: 60fps smooth rendering
+  useEffect(() => {
+    if (!isPlaying || startTime === null) {
+      setSyncTime(0);
+      return;
+    }
+
+    const updateSync = () => {
+      // Tsync = (Date.now() - startTime) in ms
+      const absoluteTime = Date.now() - startTime;
+      setSyncTime(absoluteTime);
+      setSmoothTime(absoluteTime); // Priority: Keep smoothTime in sync for display
+    };
+
+    const id = setInterval(updateSync, 16); // ~60fps updates
+    return () => clearInterval(id);
+  }, [isPlaying, startTime]);
+
+  // Soft Snap Correction: Every 3 seconds, check for drift and apply corrective snap
+  useEffect(() => {
+    if (!isPlaying || startTime === null || currentSong?.currentTime === undefined) {
+      return;
+    }
+
+    // Calculate the expected time based on bot's currentTime
+    const botTime = currentSong.currentTime; // Time from bot in ms
+    const expectedSyncTime = botTime - (manualOffset * 1000); // Subtract offset in ms
+    const currentEstimate = Date.now() - startTime;
+    
+    // Calculate the drift/error
+    const driftError = Math.abs(expectedSyncTime - currentEstimate);
+    
+    // Soft snap logic: only correct if drift is significant (> 200ms)
+    if (driftError > 200) {
+      // Hard reset when drift is too large
+      setSyncTime(expectedSyncTime);
+      setSmoothTime(expectedSyncTime);
+      setStartTime(Date.now() - botTime); // Recalibrate startTime
+    }
+    // If error is small (< 200ms), ignore to avoid visual flickering
+  }, [currentSong?.currentTime, isPlaying, startTime, manualOffset]);
 
   const cleanCacheMutation = useMutation({
     mutationFn: cleanAudioCache,
@@ -190,14 +252,30 @@ function App() {
             <div className="flex-grow flex flex-col gap-4">
               <div className="text-sm text-gray-400">
                 <div className="font-medium">{currentSong.title} - {currentSong.artist}</div>
-                <div>Current Time: {currentSong.currentTime ? `${Math.floor(currentSong.currentTime / 1000)}s` : 'N/A'}</div>
+                <div>Current Time: {smoothTime ? `${Math.floor(smoothTime / 1000)}s` : 'N/A'}</div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between text-sm">
+                  <label className="text-gray-400">Sync Offset: <span className="text-neonGreen font-medium">{manualOffset.toFixed(1)}s</span></label>
+                </div>
+                <input
+                  type="range"
+                  min="-10"
+                  max="10"
+                  step="0.1"
+                  value={manualOffset}
+                  onChange={(e) => setManualOffset(parseFloat(e.target.value))}
+                  className="w-full h-2 bg-surfaceHighlight rounded-lg appearance-none cursor-pointer accent-neonGreen"
+                />
               </div>
               
               <div className="lyrics-container max-h-64 overflow-y-auto space-y-2">
                 {lyrics ? lyrics.map((line, index) => {
-                  const LYRIC_OFFSET = 3000;
-                  const adjustedTime = (currentSong.currentTime || 0) - LYRIC_OFFSET;
-                  const isActive = adjustedTime >= line.time && (index === lyrics.length - 1 || adjustedTime < lyrics[index + 1].time);
+                  const adjustedTime = (syncTime / 1000) - manualOffset;
+                  const timeDiff = Math.abs(adjustedTime - line.time);
+                  // Highlight if within 500ms tolerance of lyric timestamp
+                  const isActive = timeDiff <= 0.5 && adjustedTime >= line.time;
                   return (
                     <div 
                       key={index} 
