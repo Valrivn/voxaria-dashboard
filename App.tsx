@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
-import { Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, ShieldCheck, Zap } from 'lucide-react';
-import { getStatus, cleanAudioCache, setSessionRestore } from './lib/voxaria-api';
+import { Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, ShieldCheck, Zap, Music } from 'lucide-react';
+import { getStatus, cleanAudioCache, setSessionRestore, summonBot, getCurrentSong, getLyrics, type LyricLine } from './lib/voxaria-api';
 
 function App() {
   const [sessionRestore, setSessionRestoreState] = useState(true);
@@ -10,6 +10,19 @@ function App() {
     queryKey: ['botStatus'],
     queryFn: getStatus,
     refetchInterval: 5000,
+  });
+
+  const { data: currentSong } = useQuery({
+    queryKey: ['currentSong'],
+    queryFn: getCurrentSong,
+    refetchInterval: 1000,
+    enabled: status?.online,
+  });
+
+  const { data: lyrics } = useQuery({
+    queryKey: ['lyrics', currentSong?.title, currentSong?.artist],
+    queryFn: () => getLyrics(currentSong!.title, currentSong!.artist),
+    enabled: !!currentSong?.title && !!currentSong?.artist,
   });
 
   const cleanCacheMutation = useMutation({
@@ -29,6 +42,16 @@ function App() {
     },
     onError: (error: Error) => {
       alert(`Failed to toggle session restore: ${error.message}`);
+    }
+  });
+
+  const summonMutation = useMutation({
+    mutationFn: summonBot,
+    onSuccess: () => {
+      alert('Bot summoned successfully! 🤖✨');
+    },
+    onError: (error: Error) => {
+      alert(`Failed to summon bot: ${error.message}`);
     }
   });
 
@@ -57,7 +80,7 @@ function App() {
       </header>
 
       {/* Main Grid */}
-      <main className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 relative z-10 flex-grow">
+      <main className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 relative z-10 flex-grow">
         
         {/* Status Card */}
         <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300">
@@ -129,6 +152,72 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+
+        {/* Summon Bot */}
+        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300">
+          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
+            <Zap className="text-neonGreen w-5 h-5" />
+            <h2 className="text-lg font-semibold">Summon Bot</h2>
+          </div>
+          
+          <p className="text-sm text-gray-400 flex-grow">
+            Call the bot to join your current voice channel in Discord.
+          </p>
+
+          <button 
+            onClick={() => summonMutation.mutate()}
+            disabled={summonMutation.isPending}
+            className="w-full py-3 px-4 rounded-xl bg-surfaceHighlight hover:bg-neonGreen hover:text-black border border-neonGreen/20 transition-all duration-300 flex items-center justify-center gap-2 font-medium disabled:opacity-50 disabled:cursor-not-allowed group"
+          >
+            {summonMutation.isPending ? (
+              <RotateCcw className="w-5 h-5 animate-spin" />
+            ) : (
+              <Zap className="w-5 h-5 group-hover:scale-110 transition-transform" />
+            )}
+            {summonMutation.isPending ? 'Summoning...' : 'Summon Bot'}
+          </button>
+        </div>
+
+        {/* Karaoke Lyrics */}
+        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300 lg:col-span-2">
+          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
+            <Music className="text-neonGreen w-5 h-5" />
+            <h2 className="text-lg font-semibold">Karaoke Lyrics</h2>
+          </div>
+          
+          {currentSong ? (
+            <div className="flex-grow flex flex-col gap-4">
+              <div className="text-sm text-gray-400">
+                <div className="font-medium">{currentSong.title} - {currentSong.artist}</div>
+                <div>Current Time: {currentSong.currentTime ? `${Math.floor(currentSong.currentTime / 1000)}s` : 'N/A'}</div>
+              </div>
+              
+              <div className="lyrics-container max-h-64 overflow-y-auto space-y-2">
+                {lyrics ? lyrics.map((line, index) => {
+                  const LYRIC_OFFSET = 3000;
+                  const adjustedTime = (currentSong.currentTime || 0) - LYRIC_OFFSET;
+                  const isActive = adjustedTime >= line.time && (index === lyrics.length - 1 || adjustedTime < lyrics[index + 1].time);
+                  return (
+                    <div 
+                      key={index} 
+                      className={`text-sm p-2 rounded transition-colors ${
+                        isActive ? 'bg-neonGreen/20 text-neonGreen font-medium' : 'text-gray-400'
+                      }`}
+                    >
+                      {line.text}
+                    </div>
+                  );
+                }) : (
+                  <div className="text-gray-400">Loading lyrics...</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="flex-grow flex items-center justify-center text-gray-400">
+              No song currently playing
+            </div>
+          )}
         </div>
 
       </main>
