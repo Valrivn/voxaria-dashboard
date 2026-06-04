@@ -1,20 +1,41 @@
-import { useState, useEffect } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
-import { Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, ShieldCheck, Zap, Music } from 'lucide-react';
-import { getStatus, cleanAudioCache, setSessionRestore, summonBot, getCurrentSong, getLyrics, type LyricLine } from './lib/voxaria-api';
+import { useState, useEffect, useRef } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { 
+  Activity, HardDrive, RotateCcw, Server, Settings2, Trash2, 
+  ShieldCheck, Zap, Music, SkipBack, XCircle, GripVertical, 
+  Save, FolderOpen, Plus, Play, Pause 
+} from 'lucide-react';
+import { 
+  getStatus, cleanAudioCache, setSessionRestore, summonBot, 
+  getCurrentSong, getLyrics, reorderQueue, removeTrack, 
+  playPrevious, savePreset, getPresets, loadPreset 
+} from './lib/voxaria-api';
 
 function App() {
-  const [sessionRestore, setSessionRestoreState] = useState(true);
-  const [smoothTime, setSmoothTime] = useState(0);
-  const [manualOffset, setManualOffset] = useState(3.0);
-  const [startTime, setStartTime] = useState<number | null>(null); // Bot's song start timestamp
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [syncTime, setSyncTime] = useState(0); // Absolute sync time in ms
+  const queryClient = useQueryClient();
   
-  const SYNC_TOLERANCE_MS = 500; // 500ms tolerance for lyric highlighting
-  const KALMAN_GAIN = 0.2;
+  // --- STATE ---
+  const [manualOffset, setManualOffset] = useState(3.0);
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
 
-  const { data: status, isLoading } = useQuery({
+  // --- REFS (High-Frequency Logic) ---
+  const smoothTimeRef = useRef(0);
+  const currentTimeTextRef = useRef<HTMLDivElement | null>(null);
+  const lyricsContainerRef = useRef<HTMLDivElement | null>(null);
+  const offsetRef = useRef(0);
+  const lastFrameRef = useRef(0);
+  const isPlayingRef = useRef(false);
+  const startTimeRef = useRef<number | null>(null);
+  
+  const correctionRef = useRef({ start: 0, from: 0, to: 0, end: 0 });
+
+  const CORRECTION_DURATION_MS = 1000; 
+  const SOFT_SNAP_THRESHOLD_MS = 250; 
+
+  // --- QUERIES ---
+  const { data: status } = useQuery({
     queryKey: ['botStatus'],
     queryFn: getStatus,
     refetchInterval: 5000,
@@ -24,18 +45,11 @@ function App() {
     queryKey: ['currentSong'],
     queryFn: async () => {
       const data = await getCurrentSong();
-      
-      // Extract startTime and isPlaying from bot response
-      if (data.startTime !== undefined) {
-        setStartTime(data.startTime);
-      }
-      if (data.isPlaying !== undefined) {
-        setIsPlaying(data.isPlaying);
-      }
-      
+      if (data.startTime !== undefined) setStartTime(data.startTime);
+      if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying);
       return data;
     },
-    refetchInterval: 3000, // Tighten to 3 seconds for aggressive drift correction
+    refetchInterval: 2000, 
     enabled: status?.online,
   });
 
@@ -45,265 +59,298 @@ function App() {
     enabled: !!currentSong?.title && !!currentSong?.artist,
   });
 
-  // High-Frequency Sync Loop: 60fps smooth rendering
-  useEffect(() => {
-    if (!isPlaying || startTime === null) {
-      setSyncTime(0);
-      return;
-    }
+  const { data: presets } = useQuery({
+    queryKey: ['presets'],
+    queryFn: getPresets,
+    refetchInterval: 10000,
+    enabled: status?.online,
+  });
 
-    const updateSync = () => {
-      // Tsync = (Date.now() - startTime) in ms
-      const absoluteTime = Date.now() - startTime;
-      setSyncTime(absoluteTime);
-      setSmoothTime(absoluteTime); // Priority: Keep smoothTime in sync for display
+  // --- MUTATIONS (Backend Sync) ---
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['currentSong'] });
+
+  const prevMutation = useMutation({ mutationFn: playPrevious, onSuccess: refresh });
+  const removeMutation = useMutation({ mutationFn: (idx: number) => removeTrack(idx), onSuccess: refresh });
+  const reorderMutation = useMutation({ 
+    mutationFn: ({oldIdx, newIdx}: {oldIdx: number, newIdx: number}) => reorderQueue(oldIdx, newIdx),
+    onSuccess: refresh 
+  });
+  const savePresetMutation = useMutation({ 
+    mutationFn: (name: string) => savePreset(name), 
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['presets'] }) 
+  });
+  const loadPresetMutation = useMutation({ mutationFn: (name: string) => loadPreset(name), onSuccess: refresh });
+  const cleanCacheMutation = useMutation({ mutationFn: cleanAudioCache, onSuccess: () => alert('Cache Purged! 🧹') });
+  const summonMutation = useMutation({ mutationFn: summonBot, onSuccess: () => alert('Bot Summoned! 🤖') });
+
+  // Sync refs with state
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => { startTimeRef.current = startTime; }, [startTime]);
+
+  // --- 60FPS ANIMATION LOOP ---
+  useEffect(() => {
+    const animate = () => {
+      // If paused or no song, don't advance the clock
+      if (!isPlayingRef.current || startTimeRef.current === null) {
+        lastFrameRef.current = performance.now();
+        requestAnimationFrame(animate);
+        return;
+      }
+
+      const now = performance.now();
+      const absoluteElapsed = Date.now() - startTimeRef.current;
+      
+      const corr = correctionRef.current;
+      let activeOffset = offsetRef.current;
+      
+      if (now < corr.end) {
+        const progress = (now - corr.start) / CORRECTION_DURATION_MS;
+        activeOffset = corr.from + (corr.to - corr.from) * progress;
+      } else if (corr.end !== 0) {
+        activeOffset = corr.to;
+        offsetRef.current = corr.to;
+        correctionRef.current.end = 0;
+      }
+
+      const totalSmoothTime = absoluteElapsed + activeOffset;
+      smoothTimeRef.current = totalSmoothTime;
+
+      // Direct DOM Updates for Performance
+      if (currentTimeTextRef.current) {
+        currentTimeTextRef.current.textContent = `${Math.floor(totalSmoothTime / 1000)}s`;
+      }
+
+      if (lyricsContainerRef.current) {
+        const adjustedTimeSec = (totalSmoothTime / 1000) - manualOffset;
+        const nodes = lyricsContainerRef.current.querySelectorAll<HTMLDivElement>('[data-lyric-time]');
+        
+        nodes.forEach((node) => {
+          const lineTime = Number(node.dataset.lyricTime);
+          // 3 second window for the highlight to stay active
+          const isActive = adjustedTimeSec >= lineTime && (adjustedTimeSec < (lineTime + 3));
+          
+          node.classList.toggle('bg-neonGreen/10', isActive);
+          node.classList.toggle('text-neonGreen', isActive);
+          node.classList.toggle('scale-105', isActive);
+          node.classList.toggle('shadow-[0_0_25px_rgba(57,255,20,0.15)]', isActive);
+          node.classList.toggle('border-neonGreen/30', isActive);
+        });
+      }
+
+      requestAnimationFrame(animate);
     };
 
-    const id = setInterval(updateSync, 16); // ~60fps updates
-    return () => clearInterval(id);
-  }, [isPlaying, startTime]);
+    const id = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(id);
+  }, [manualOffset]);
 
-  // Soft Snap Correction: Every 3 seconds, check for drift and apply corrective snap
+  // --- SOFT SYNC LOGIC ---
   useEffect(() => {
-    if (!isPlaying || startTime === null || currentSong?.currentTime === undefined) {
-      return;
-    }
+    if (!isPlaying || startTime === null || currentSong?.currentTime === undefined) return;
 
-    // Calculate the expected time based on bot's currentTime
-    const botTime = currentSong.currentTime; // Time from bot in ms
-    const expectedSyncTime = botTime - (manualOffset * 1000); // Subtract offset in ms
-    const currentEstimate = Date.now() - startTime;
-    
-    // Calculate the drift/error
-    const driftError = Math.abs(expectedSyncTime - currentEstimate);
-    
-    // Soft snap logic: only correct if drift is significant (> 200ms)
-    if (driftError > 200) {
-      // Hard reset when drift is too large
-      setSyncTime(expectedSyncTime);
-      setSmoothTime(expectedSyncTime);
-      setStartTime(Date.now() - botTime); // Recalibrate startTime
-    }
-    // If error is small (< 200ms), ignore to avoid visual flickering
-  }, [currentSong?.currentTime, isPlaying, startTime, manualOffset]);
+    const botTimeMs = currentSong.currentTime * 1000;
+    const localTimeMs = Date.now() - startTime;
+    const targetOffset = botTimeMs - localTimeMs;
+    const currentOffset = offsetRef.current;
+    const error = targetOffset - currentOffset;
 
-  const cleanCacheMutation = useMutation({
-    mutationFn: cleanAudioCache,
-    onSuccess: () => {
-      alert('Audio cache cleaned successfully! 🎵✨');
-    },
-    onError: (error: Error) => {
-      alert(`Failed to clean cache: ${error.message}`);
+    if (Math.abs(error) > SOFT_SNAP_THRESHOLD_MS) {
+      const now = performance.now();
+      correctionRef.current = {
+        start: now,
+        from: currentOffset,
+        to: targetOffset,
+        end: now + CORRECTION_DURATION_MS,
+      };
     }
-  });
+  }, [currentSong?.currentTime, isPlaying, startTime]);
 
-  const toggleSessionRestoreMutation = useMutation({
-    mutationFn: setSessionRestore,
-    onSuccess: (_, variables) => {
-      setSessionRestoreState(variables);
-    },
-    onError: (error: Error) => {
-      alert(`Failed to toggle session restore: ${error.message}`);
+  // --- DRAG & DROP HANDLERS ---
+  const onDragOver = (e: React.DragEvent) => e.preventDefault();
+  const onDrop = (newIndex: number) => {
+    if (draggedIndex !== null && draggedIndex !== newIndex) {
+      reorderMutation.mutate({ oldIdx: draggedIndex, newIdx: newIndex });
     }
-  });
-
-  const summonMutation = useMutation({
-    mutationFn: summonBot,
-    onSuccess: () => {
-      alert('Bot summoned successfully! 🤖✨');
-    },
-    onError: (error: Error) => {
-      alert(`Failed to summon bot: ${error.message}`);
-    }
-  });
+    setDraggedIndex(null);
+  };
 
   return (
-    <div className="min-h-screen flex flex-col p-6 md:p-12 relative overflow-hidden">
-      {/* Background decoration */}
-      <div className="absolute top-[-20%] left-[-10%] w-96 h-96 bg-neonGreen/10 rounded-full blur-[100px] pointer-events-none" />
-      <div className="absolute bottom-[-10%] right-[-5%] w-80 h-80 bg-neonGreen/10 rounded-full blur-[100px] pointer-events-none" />
+    <div className="min-h-screen flex flex-col p-6 md:p-8 bg-[#080808] text-white font-sans selection:bg-neonGreen selection:text-black">
+      {/* Dynamic Background */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-[-10%] left-[-10%] w-[600px] h-[600px] bg-neonGreen/5 rounded-full blur-[140px]" />
+        <div className="absolute bottom-[-5%] right-[-5%] w-[400px] h-[400px] bg-purple-500/5 rounded-full blur-[120px]" />
+      </div>
 
-      {/* Header */}
-      <header className="flex items-center justify-between mb-12 relative z-10">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-surfaceHighlight flex items-center justify-center neon-glow">
-            <Zap className="text-neonGreen w-6 h-6" />
+      <header className="flex items-center justify-between mb-8 relative z-10">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-neonGreen to-emerald-600 p-[1px]">
+            <div className="w-full h-full rounded-2xl bg-[#080808] flex items-center justify-center">
+              <Zap className="text-neonGreen w-6 h-6 fill-neonGreen/20" />
+            </div>
           </div>
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">Voxtaria<span className="text-neonGreen">.</span></h1>
-            <p className="text-sm text-gray-400">Advanced Bot Control Panel</p>
+            <h1 className="text-2xl font-black tracking-tighter italic">VOXTARIA<span className="text-neonGreen">.</span></h1>
+            <div className="flex items-center gap-2">
+               <div className={`w-1.5 h-1.5 rounded-full ${status?.online ? 'bg-neonGreen' : 'bg-red-500'}`} />
+               <span className="text-[10px] text-gray-500 uppercase font-bold tracking-widest">
+                 {status?.online ? `Online • ${status.pingMs}ms` : 'System Offline'}
+               </span>
+            </div>
           </div>
         </div>
         
-        <div className="flex items-center gap-2 glass-panel px-4 py-2">
-          <div className={`w-3 h-3 rounded-full ${status?.online ? 'bg-neonGreen animate-pulse shadow-[0_0_10px_#39ff14]' : 'bg-red-500'}`} />
-          <span className="text-sm font-medium">{status?.online ? 'System Online' : 'Connecting...'}</span>
+        <div className="flex gap-2">
+          <button onClick={() => summonMutation.mutate()} className="glass-panel px-4 py-2 text-xs font-bold hover:text-neonGreen transition-colors border border-white/5">
+            SUMMON
+          </button>
         </div>
       </header>
 
-      {/* Main Grid */}
-      <main className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 relative z-10 flex-grow">
+      <main className="grid grid-cols-1 lg:grid-cols-12 gap-6 relative z-10">
         
-        {/* Status Card */}
-        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300">
-          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
-            <Activity className="text-neonGreen w-5 h-5" />
-            <h2 className="text-lg font-semibold">Real-time Status</h2>
-          </div>
-          
-          <div className="flex-grow flex flex-col justify-center gap-6">
-            <div className="flex justify-between items-center">
-              <span className="text-gray-400 flex items-center gap-2"><Server className="w-4 h-4"/> Active Shard</span>
-              <span className="text-xl font-mono">{isLoading ? '--' : status?.activeShard ?? 0}</span>
+        {/* Left Column: Navigation & Presets (3 cols) */}
+        <div className="lg:col-span-3 space-y-6">
+          <section className="glass-panel p-5 space-y-4 border-t-2 border-neonGreen/20">
+            <h2 className="text-[10px] font-black text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2">
+              <FolderOpen className="w-3.5 h-3.5" /> Saved Presets
+            </h2>
+            <div className="space-y-1.5 max-h-[200px] overflow-y-auto pr-2 custom-scrollbar">
+              {presets?.map((p: any) => (
+                <button 
+                  key={p.name}
+                  onClick={() => loadPresetMutation.mutate(p.name)}
+                  className="w-full text-left p-3 rounded-xl bg-white/[0.03] hover:bg-neonGreen/10 group transition-all flex justify-between items-center"
+                >
+                  <span className="text-sm font-medium group-hover:text-neonGreen">{p.name}</span>
+                  <span className="text-[10px] text-gray-600">{p.count} tracks</span>
+                </button>
+              ))}
+              {!presets?.length && <div className="text-[10px] text-gray-600 italic">No presets saved yet.</div>}
             </div>
-            
-            <div className="flex justify-between items-center">
-              <span className="text-gray-400 flex items-center gap-2"><Activity className="w-4 h-4"/> Latency</span>
-              <span className="text-xl font-mono text-neonGreen">{isLoading ? '--' : `${status?.pingMs ?? 0}ms`}</span>
-            </div>
-          </div>
+            <button 
+              onClick={() => {
+                const name = prompt("Enter preset name:");
+                if (name) savePresetMutation.mutate(name);
+              }}
+              className="w-full py-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs font-bold transition-all flex items-center justify-center gap-2"
+            >
+              <Plus className="w-4 h-4" /> Save Current Queue
+            </button>
+          </section>
+
+          <section className="glass-panel p-5 space-y-4">
+            <h2 className="text-[10px] font-black text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2">
+              <Settings2 className="w-3.5 h-3.5" /> Hardware
+            </h2>
+            <button onClick={() => cleanCacheMutation.mutate()} className="w-full py-3 rounded-xl bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">
+              Purge Audio Cache
+            </button>
+          </section>
         </div>
 
-        {/* Cache Management */}
-        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300">
-          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
-            <HardDrive className="text-neonGreen w-5 h-5" />
-            <h2 className="text-lg font-semibold">Storage & Cache</h2>
-          </div>
-          
-          <p className="text-sm text-gray-400 flex-grow">
-            Clear temporary audio files and free up disk space. Protected files will be preserved automatically.
-          </p>
-
-          <button 
-            onClick={() => cleanCacheMutation.mutate()}
-            disabled={cleanCacheMutation.isPending}
-            className="w-full py-3 px-4 rounded-xl bg-surfaceHighlight hover:bg-neonGreen hover:text-black border border-neonGreen/20 transition-all duration-300 flex items-center justify-center gap-2 font-medium disabled:opacity-50 disabled:cursor-not-allowed group"
-          >
-            {cleanCacheMutation.isPending ? (
-              <RotateCcw className="w-5 h-5 animate-spin" />
-            ) : (
-              <Trash2 className="w-5 h-5 group-hover:scale-110 transition-transform" />
-            )}
-            {cleanCacheMutation.isPending ? 'Cleaning...' : 'Purge Audio Cache'}
-          </button>
-        </div>
-
-        {/* Settings */}
-        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300">
-          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
-            <Settings2 className="text-neonGreen w-5 h-5" />
-            <h2 className="text-lg font-semibold">System Preferences</h2>
-          </div>
-          
-          <div className="flex-grow flex flex-col gap-4">
-            <div className="flex items-center justify-between p-4 rounded-xl bg-surfaceHighlight/50 border border-surfaceHighlight">
-              <div className="flex flex-col gap-1">
-                <span className="font-medium flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-neonGreen" /> Session Restore
-                </span>
-                <span className="text-xs text-gray-400">Save queue states on restart</span>
+        {/* Middle Column: Lyrics & Main Player (6 cols) */}
+        <div className="lg:col-span-6 space-y-6">
+          <div className="glass-panel p-8 flex flex-col gap-8 min-h-[650px] border-t-2 border-neonGreen">
+            <div className="flex justify-between items-start">
+              <div className="space-y-1">
+                <h2 className="text-3xl font-black tracking-tight leading-tight">
+                  {currentSong?.title ?? "System Idle"}
+                </h2>
+                <p className="text-neonGreen font-medium tracking-wide">
+                  {currentSong?.artist ?? "Ready for input..."}
+                </p>
               </div>
-              
-              <button 
-                onClick={() => toggleSessionRestoreMutation.mutate(!sessionRestore)}
-                disabled={toggleSessionRestoreMutation.isPending}
-                className={`relative w-14 h-8 rounded-full transition-colors duration-300 focus:outline-none ${sessionRestore ? 'bg-neonGreen/20 border border-neonGreen' : 'bg-surfaceHighlight border border-gray-700'}`}
-              >
-                <div className={`absolute top-1 left-1 w-5 h-5 rounded-full transition-transform duration-300 ${sessionRestore ? 'translate-x-6 bg-neonGreen neon-glow' : 'translate-x-0 bg-gray-400'}`} />
+              <div ref={currentTimeTextRef} className="text-5xl font-black text-white/5 select-none italic">
+                0s
+              </div>
+            </div>
+
+            {/* Sync Controls */}
+            <div className="bg-white/[0.03] p-4 rounded-2xl space-y-3">
+              <div className="flex justify-between items-center text-[10px] font-bold uppercase tracking-widest text-gray-500">
+                <span>Latency Compensation</span>
+                <span className="text-neonGreen">{manualOffset.toFixed(1)}s Delay</span>
+              </div>
+              <input
+                type="range" min="-2" max="10" step="0.1" value={manualOffset}
+                onChange={(e) => setManualOffset(parseFloat(e.target.value))}
+                className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-neonGreen"
+              />
+            </div>
+
+            {/* Lyrics Container */}
+            <div 
+              ref={lyricsContainerRef}
+              className="flex-grow overflow-y-auto overflow-x-hidden py-4 space-y-3 pr-2 custom-scrollbar mask-fade-edges"
+            >
+              {lyrics ? lyrics.map((line: any, idx: number) => (
+                <div 
+                  key={idx}
+                  data-lyric-time={line.time}
+                  className="w-[90%] mx-auto py-3 px-6 rounded-2xl text-xl md:text-2xl font-bold text-gray-600 transition-all duration-500 hover:text-gray-400 text-center select-none border border-transparent origin-center"
+                >
+                  {line.text}
+                </div>
+              )) : (
+                <div className="h-full flex items-center justify-center text-gray-700 text-sm italic">
+                  Awaiting audio signal for lyric synchronization...
+                </div>
+              )}
+            </div>
+
+            {/* Bottom Controls */}
+            <div className="flex items-center justify-center gap-8 pt-4 border-t border-white/5">
+              <button onClick={() => prevMutation.mutate()} className="p-4 rounded-full bg-white/5 hover:bg-white/10 transition-all text-gray-400 hover:text-white">
+                <SkipBack className="w-6 h-6" />
+              </button>
+              <div className="w-16 h-16 rounded-full bg-neonGreen flex items-center justify-center text-black shadow-[0_0_20px_rgba(57,255,20,0.3)]">
+                {isPlaying ? <Pause className="w-8 h-8 fill-black" /> : <Play className="w-8 h-8 fill-black" />}
+              </div>
+              <button className="p-4 rounded-full bg-white/5 text-gray-800 cursor-not-allowed">
+                <RotateCcw className="w-6 h-6" />
               </button>
             </div>
           </div>
         </div>
 
-        {/* Summon Bot */}
-        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300">
-          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
-            <Zap className="text-neonGreen w-5 h-5" />
-            <h2 className="text-lg font-semibold">Summon Bot</h2>
-          </div>
-          
-          <p className="text-sm text-gray-400 flex-grow">
-            Call the bot to join your current voice channel in Discord.
-          </p>
-
-          <button 
-            onClick={() => summonMutation.mutate()}
-            disabled={summonMutation.isPending}
-            className="w-full py-3 px-4 rounded-xl bg-surfaceHighlight hover:bg-neonGreen hover:text-black border border-neonGreen/20 transition-all duration-300 flex items-center justify-center gap-2 font-medium disabled:opacity-50 disabled:cursor-not-allowed group"
-          >
-            {summonMutation.isPending ? (
-              <RotateCcw className="w-5 h-5 animate-spin" />
-            ) : (
-              <Zap className="w-5 h-5 group-hover:scale-110 transition-transform" />
-            )}
-            {summonMutation.isPending ? 'Summoning...' : 'Summon Bot'}
-          </button>
-        </div>
-
-        {/* Karaoke Lyrics */}
-        <div className="glass-panel p-6 flex flex-col gap-6 transform transition-transform hover:scale-[1.02] duration-300 lg:col-span-2">
-          <div className="flex items-center gap-3 border-b border-surfaceHighlight pb-4">
-            <Music className="text-neonGreen w-5 h-5" />
-            <h2 className="text-lg font-semibold">Karaoke Lyrics</h2>
-          </div>
-          
-          {currentSong ? (
-            <div className="flex-grow flex flex-col gap-4">
-              <div className="text-sm text-gray-400">
-                <div className="font-medium">{currentSong.title} - {currentSong.artist}</div>
-                <div>Current Time: {smoothTime ? `${Math.floor(smoothTime / 1000)}s` : 'N/A'}</div>
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between text-sm">
-                  <label className="text-gray-400">Sync Offset: <span className="text-neonGreen font-medium">{manualOffset.toFixed(1)}s</span></label>
+        {/* Right Column: Queue (3 cols) */}
+        <div className="lg:col-span-3">
+          <div className="glass-panel p-5 flex flex-col gap-4 h-full border-t-2 border-purple-500/30">
+            <h2 className="text-[10px] font-black text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2">
+              <Music className="w-3.5 h-3.5" /> Active Queue
+            </h2>
+            <div className="space-y-2 flex-grow overflow-y-auto pr-1 custom-scrollbar">
+              {currentSong?.queue?.map((track: any, idx: number) => (
+                <div 
+                  key={`${track.id}-${idx}`}
+                  draggable
+                  onDragStart={() => setDraggedIndex(idx)}
+                  onDragOver={onDragOver}
+                  onDrop={() => onDrop(idx)}
+                  className={`group flex items-center gap-3 p-3 rounded-xl bg-white/[0.03] border border-white/5 cursor-grab active:cursor-grabbing hover:border-neonGreen/20 transition-all ${draggedIndex === idx ? 'opacity-20' : ''}`}
+                >
+                  <GripVertical className="w-4 h-4 text-gray-700 group-hover:text-gray-500 transition-colors flex-shrink-0" />
+                  <div className="flex-grow min-w-0">
+                    <div className="text-[11px] font-bold truncate group-hover:text-neonGreen transition-colors">{track.title}</div>
+                    <div className="text-[9px] text-gray-600 truncate uppercase tracking-tighter">{track.artist}</div>
+                  </div>
+                  <button 
+                    onClick={() => removeMutation.mutate(idx)}
+                    className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-600 hover:text-red-500 transition-all"
+                  >
+                    <XCircle className="w-4 h-4" />
+                  </button>
                 </div>
-                <input
-                  type="range"
-                  min="-10"
-                  max="10"
-                  step="0.1"
-                  value={manualOffset}
-                  onChange={(e) => setManualOffset(parseFloat(e.target.value))}
-                  className="w-full h-2 bg-surfaceHighlight rounded-lg appearance-none cursor-pointer accent-neonGreen"
-                />
-              </div>
-              
-              <div className="lyrics-container max-h-64 overflow-y-auto space-y-2">
-                {lyrics ? lyrics.map((line, index) => {
-                  const adjustedTime = (syncTime / 1000) - manualOffset;
-                  const timeDiff = Math.abs(adjustedTime - line.time);
-                  // Highlight if within 500ms tolerance of lyric timestamp
-                  const isActive = timeDiff <= 0.5 && adjustedTime >= line.time;
-                  return (
-                    <div 
-                      key={index} 
-                      className={`text-sm p-2 rounded transition-colors ${
-                        isActive ? 'bg-neonGreen/20 text-neonGreen font-medium' : 'text-gray-400'
-                      }`}
-                    >
-                      {line.text}
-                    </div>
-                  );
-                }) : (
-                  <div className="text-gray-400">Loading lyrics...</div>
-                )}
-              </div>
+              ))}
+              {!currentSong?.queue?.length && (
+                <div className="text-center py-12 text-gray-700 text-xs italic">Queue is empty</div>
+              )}
             </div>
-          ) : (
-            <div className="flex-grow flex items-center justify-center text-gray-400">
-              No song currently playing
-            </div>
-          )}
+          </div>
         </div>
 
       </main>
-      
-      {/* Footer */}
-      <footer className="mt-12 text-center text-sm text-gray-500 relative z-10">
-        <p>© {new Date().getFullYear()} Voxtaria. Powered by advanced audio rendering.</p>
-      </footer>
     </div>
   );
 }
